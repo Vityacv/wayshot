@@ -21,10 +21,14 @@ use std::{
 };
 
 use dispatch::{DMABUFState, LayerShellState};
-use image::{DynamicImage, imageops::replace};
+use image::{ColorType, DynamicImage, imageops::replace};
 use khronos_egl::{self as egl, Instance};
 use memmap2::MmapMut;
-use screencopy::{DMAFrameFormat, DMAFrameGuard, EGLImageGuard, FrameData, FrameGuard};
+use screencopy::create_shm_fd;
+pub use screencopy::{
+    DMAFrameCopy, DMAFrameFormat, DMAFrameGuard, EGLImageGuard, FrameCopy, FrameData, FrameFormat,
+    FrameGuard,
+};
 use tracing::debug;
 use wayland_client::{
     Connection, EventQueue, Proxy,
@@ -69,10 +73,10 @@ use wayland_protocols_wlr::{
 };
 
 use crate::{
+    convert::create_converter,
     dispatch::{CaptureFrameState, FrameState, OutputCaptureState, WayshotState},
     output::OutputInfo,
     region::{EmbeddedRegion, LogicalRegion, RegionCapturer, Size, TopLevel},
-    screencopy::{FrameCopy, FrameFormat, create_shm_fd},
 };
 
 pub use crate::error::{Error, Result};
@@ -110,6 +114,12 @@ impl WayshotConnection {
         let conn = Connection::connect_to_env()?;
 
         Self::from_connection(conn)
+    }
+
+    /// Create a [`WayshotConnection`] with DMA-BUF support enabled.
+    pub fn new_with_dmabuf(device_path: &str) -> Result<Self> {
+        let conn = Connection::connect_to_env()?;
+        Self::from_connection_with_dmabuf(conn, device_path)
     }
 
     /// Recommended if you already have a [`wayland_client::Connection`].
@@ -542,12 +552,48 @@ impl WayshotConnection {
                         capture_region,
                     )?;
                 let gbm = &dmabuf_state.gbmdev;
-                let bo = gbm.create_buffer_object::<()>(
-                    frame_format.size.width,
-                    frame_format.size.height,
-                    gbm::Format::try_from(frame_format.format)?,
+                let gbm_format = gbm::Format::try_from(frame_format.format)?;
+                let usage_candidates = [
                     BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
-                )?;
+                    BufferObjectFlags::RENDERING,
+                    BufferObjectFlags::WRITE | BufferObjectFlags::LINEAR,
+                    BufferObjectFlags::WRITE,
+                    BufferObjectFlags::LINEAR,
+                    BufferObjectFlags::empty(),
+                ];
+                let mut buffer_object = None;
+                for usage in usage_candidates {
+                    if !usage.is_empty() && !gbm.is_format_supported(gbm_format, usage) {
+                        continue;
+                    }
+                    match gbm.create_buffer_object::<()>(
+                        frame_format.size.width,
+                        frame_format.size.height,
+                        gbm_format,
+                        usage,
+                    ) {
+                        Ok(bo) => {
+                            tracing::debug!(
+                                "Created GBM buffer with usage flags {usage:?} for format 0x{:x}",
+                                frame_format.format
+                            );
+                            buffer_object = Some(bo);
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                "Failed to create GBM buffer with usage {usage:?}: {err}"
+                            );
+                        }
+                    }
+                }
+                let bo = buffer_object.ok_or_else(|| {
+                    tracing::error!(
+                        "Unable to allocate GBM buffer for format 0x{:x}",
+                        frame_format.format
+                    );
+                    Error::NoSupportedBufferFormat
+                })?;
 
                 let stride = bo.stride();
                 let modifier: u64 = bo.modifier().into();
@@ -690,6 +736,7 @@ impl WayshotConnection {
                 matches!(
                     frame.format,
                     wl_shm::Format::Xbgr2101010
+                        | wl_shm::Format::Xrgb2101010
                         | wl_shm::Format::Abgr2101010
                         | wl_shm::Format::Argb8888
                         | wl_shm::Format::Xrgb8888
@@ -1039,9 +1086,22 @@ impl WayshotConnection {
             &mem_file,
             capture_region,
         )?;
-
-        let frame_mmap = unsafe { MmapMut::map_mut(&mem_file)? };
-
+        let mut frame_mmap = unsafe { MmapMut::map_mut(&mem_file)? };
+        let data = &mut *frame_mmap;
+        let frame_color_type = match frame_format.format {
+            wl_shm::Format::Xrgb2101010 | wl_shm::Format::Xbgr2101010 => ColorType::Rgb16,
+            wl_shm::Format::Argb2101010 | wl_shm::Format::Abgr2101010 => ColorType::Rgba16,
+            _ => match create_converter(frame_format.format) {
+                Some(converter) => converter.convert_inplace(data),
+                _ => {
+                    tracing::error!("Unsupported buffer format: {:?}", frame_format.format);
+                    tracing::error!(
+                        "You can send a feature request for the above format to the mailing list for wayshot over at https://sr.ht/~shinyzenith/wayshot."
+                    );
+                    return Err(Error::NoSupportedBufferFormat);
+                }
+            },
+        };
         let rotated_physical_size = match output_info.transform {
             Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
                 Size {
@@ -1053,7 +1113,7 @@ impl WayshotConnection {
         };
         let frame_copy = FrameCopy {
             frame_format,
-            frame_color_type: image::ColorType::Rgb8,
+            frame_color_type,
             frame_data: FrameData::Mmap(frame_mmap),
             transform: output_info.transform,
             logical_region: capture_region
@@ -1062,6 +1122,44 @@ impl WayshotConnection {
             physical_size: rotated_physical_size,
         };
         tracing::debug!("Created frame copy: {:#?}", frame_copy);
+        Ok((frame_copy, frame_guard))
+    }
+
+    /// Get a DMA-BUF backed frame for an output without converting it to 8-bit.
+    ///
+    /// This keeps the compositor provided pixel format intact which is required for HDR captures.
+    #[tracing::instrument(skip_all, fields(output = format!("{output_info}"), region = capture_region.map(|r| format!("{r:}")).unwrap_or("fullscreen".to_string())))]
+    fn capture_frame_copy_dmabuf(
+        &self,
+        cursor_overlay: bool,
+        output_info: &OutputInfo,
+        capture_region: Option<EmbeddedRegion>,
+    ) -> Result<(DMAFrameCopy, DMAFrameGuard)> {
+        let (frame_format, frame_guard, buffer_object) = self.capture_output_frame_dmabuf(
+            cursor_overlay,
+            &output_info.wl_output,
+            capture_region,
+        )?;
+
+        let rotated_physical_size = match output_info.transform {
+            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+                Size {
+                    width: frame_format.size.height,
+                    height: frame_format.size.width,
+                }
+            }
+            _ => frame_format.size,
+        };
+        let frame_copy = DMAFrameCopy {
+            frame_format,
+            buffer_object,
+            transform: output_info.transform,
+            logical_region: capture_region
+                .map(|capture_region| capture_region.logical())
+                .unwrap_or(output_info.logical_region),
+            physical_size: rotated_physical_size,
+        };
+        tracing::debug!("Created DMA frame copy: {:#?}", frame_copy);
         Ok((frame_copy, frame_guard))
     }
 
@@ -1074,6 +1172,21 @@ impl WayshotConnection {
             .iter()
             .map(|(output_info, capture_region)| {
                 self.capture_frame_copy(cursor_overlay, output_info, *capture_region)
+                    .map(|(frame_copy, frame_guard)| (frame_copy, frame_guard, output_info.clone()))
+            })
+            .collect()
+    }
+
+    /// Capture DMA-BUF backed frames for each provided output/region pair.
+    pub fn capture_frame_copies_dmabuf(
+        &self,
+        output_capture_regions: &[(OutputInfo, Option<EmbeddedRegion>)],
+        cursor_overlay: bool,
+    ) -> Result<Vec<(DMAFrameCopy, DMAFrameGuard, OutputInfo)>> {
+        output_capture_regions
+            .iter()
+            .map(|(output_info, capture_region)| {
+                self.capture_frame_copy_dmabuf(cursor_overlay, output_info, *capture_region)
                     .map(|(frame_copy, frame_guard)| (frame_copy, frame_guard, output_info.clone()))
             })
             .collect()
@@ -1370,6 +1483,15 @@ impl WayshotConnection {
         }
 
         self.screenshot_region_capturer(RegionCapturer::Outputs(outputs.to_owned()), cursor_overlay)
+    }
+
+    /// Take a screenshot of a specific logical region.
+    pub fn screenshot_region(
+        &self,
+        region: LogicalRegion,
+        cursor_overlay: bool,
+    ) -> Result<DynamicImage> {
+        self.screenshot_region_capturer(RegionCapturer::Region(region), cursor_overlay)
     }
 
     /// Take a screenshot from all accessible outputs.

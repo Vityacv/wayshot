@@ -1,7 +1,5 @@
 use clap::ValueEnum;
 use eyre::{ContextCompat, Error, bail};
-use notify_rust::Notification;
-
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -36,14 +34,73 @@ pub fn waysip_to_region(
     })
 }
 
+pub fn parse_geometry_str(geometry: &str) -> Result<LogicalRegion> {
+    // Expected format: "x,y widthxheight"
+    let mut parts = geometry.split_whitespace();
+    let xy = parts
+        .next()
+        .ok_or_else(|| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?;
+    let wh = parts
+        .next()
+        .ok_or_else(|| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?;
+
+    if parts.next().is_some() {
+        return Err(libwayshot::Error::FreezeCallbackError(
+            "invalid geometry".to_string(),
+        ));
+    }
+
+    let mut xy_parts = xy.split(',');
+    let x: i32 = xy_parts
+        .next()
+        .ok_or_else(|| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?
+        .parse()
+        .map_err(|_| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?;
+    let y: i32 = xy_parts
+        .next()
+        .ok_or_else(|| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?
+        .parse()
+        .map_err(|_| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?;
+
+    if xy_parts.next().is_some() {
+        return Err(libwayshot::Error::FreezeCallbackError(
+            "invalid geometry".to_string(),
+        ));
+    }
+
+    let mut wh_parts = wh.split('x');
+    let width: u32 = wh_parts
+        .next()
+        .ok_or_else(|| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?
+        .parse()
+        .map_err(|_| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?;
+    let height: u32 = wh_parts
+        .next()
+        .ok_or_else(|| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?
+        .parse()
+        .map_err(|_| libwayshot::Error::FreezeCallbackError("invalid geometry".to_string()))?;
+
+    if wh_parts.next().is_some() {
+        return Err(libwayshot::Error::FreezeCallbackError(
+            "invalid geometry".to_string(),
+        ));
+    }
+
+    Ok(LogicalRegion {
+        inner: Region {
+            position: Position { x, y },
+            size: Size { width, height },
+        },
+    })
+}
+
 /// Supported image encoding formats.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EncodingFormat {
     /// JPG/JPEG encoder.
     Jpg,
     /// PNG encoder.
-    #[default]
     Png,
     /// PPM encoder.
     Ppm,
@@ -53,6 +110,12 @@ pub enum EncodingFormat {
     Webp,
     /// Avif encoder,
     Avif,
+}
+
+impl Default for EncodingFormat {
+    fn default() -> Self {
+        Self::Png
+    }
 }
 
 impl From<EncodingFormat> for image::ImageFormat {
@@ -167,40 +230,3 @@ pub fn get_full_file_name(path: &Path, filename_format: &str, encoding: Encoding
 }
 
 const TIMEOUT: i32 = 5000;
-
-#[derive(Debug, Clone)]
-pub enum ShotResult {
-    Output { name: String },
-    Toplevel { name: String },
-    Area,
-    All,
-}
-
-pub fn send_notification(shot_result: Result<ShotResult, &Error>) {
-    match shot_result {
-        Ok(result) => {
-            let body = match result {
-                ShotResult::Output { name } => {
-                    format!("Screenshot of output '{}' saved", name)
-                }
-                ShotResult::Toplevel { name } => {
-                    format!("Screenshot of toplevel '{}' saved", name)
-                }
-                ShotResult::Area => "Screenshot of selected area saved".to_string(),
-                ShotResult::All => "Screenshot of all outputs saved".to_string(),
-            };
-            let _ = Notification::new()
-                .summary("Screenshot Taken")
-                .body(&body)
-                .timeout(TIMEOUT)
-                .show();
-        }
-        Err(e) => {
-            let _ = Notification::new()
-                .summary("Screenshot Failed")
-                .body(&e.to_string())
-                .timeout(TIMEOUT)
-                .show();
-        }
-    }
-}

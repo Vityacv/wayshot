@@ -38,9 +38,13 @@ pub struct Cli {
     #[arg(long, verbatim_doc_comment)]
     pub log_level: Option<Level>,
 
-    /// Region aware screenshotting
+    /// Region aware screenshotting (interactive)
     #[arg(short, long)]
     pub geometry: bool,
+
+    /// Capture a geometry specified as `x,y widthxheight` (from slurp)
+    #[arg(long, value_name = "GEOMETRY", conflicts_with = "geometry")]
+    pub geometry_str: Option<String>,
 
     /// Enable cursor in screenshots
     #[arg(short, long)]
@@ -91,4 +95,25 @@ pub struct Cli {
     ///     3. `None` -- if the config isn't found, the `Config::default()` will be used
     #[arg(long, verbatim_doc_comment)]
     pub config: Option<PathBuf>,
+
+    /// Capture directly into a DMA-BUF backed buffer and dump the raw contents to disk.
+    /// Optionally override the DRM render node to use (defaults to `/dev/dri/renderD128`).
+    #[arg(
+        long,
+        value_name = "DRM_RENDER_NODE",
+        num_args = 0..=1,
+        default_missing_value = "/dev/dri/renderD128",
+        requires = "output",
+        conflicts_with_all = ["geometry", "choose_output"]
+    )]
+    pub dmabuf: Option<PathBuf>,
+
+    /// Export PNGs with a minimal HDR ICC profile when 10-bit data is detected.
+    #[arg(long)]
+    pub embed_hdr_icc: bool,
+
+    /// Additionally write a tone-mapped SDR copy of the screenshot to this path.
+    /// The file extension decides the encoding (e.g. `.png`, `.jpg`, `.webp`).
+    #[arg(long, value_name = "FILE")]
+    pub tone_map_file: Option<PathBuf>,
 }

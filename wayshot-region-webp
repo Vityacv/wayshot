@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+
+GEOM=$(slurp -f '%o %x %y %w %h') || exit 1
+read OUTPUT X Y W H <<< "$GEOM"
+read OX OY <<< "$(swaymsg -t get_outputs | jq -r --arg out "$OUTPUT" '.[] | select(.name==$out) | "\(.rect.x) \(.rect.y)"')"
+CX=$((X - OX))
+CY=$((Y - OY))
+
+if (( CX < 0 )); then
+  W=$((W + CX))
+  CX=0
+fi
+if (( CY < 0 )); then
+  H=$((H + CY))
+  CY=0
+fi
+~/proj/wayshot/target/release/wayshot --log-level error --output "$OUTPUT" --embed-hdr-icc - | ffmpeg -y -f png_pipe -i - \
+  -vf "libplacebo=tonemapping=bt.2390:color_primaries=bt709:color_trc=bt709:colorspace=bt709,crop=${W}:${H}:${CX}:${CY}" \
+  -c:v libwebp -lossless 1 /tmp/screen.webp
+notify-send "Wayshot region" "Saved /tmp/screen.webp"

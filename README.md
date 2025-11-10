@@ -1,3 +1,7 @@
+# HDR-focused fork (Oct 2025)
+
+This fork adds 10-bit/HDR capture helpers, tone-mapping scripts, and CLI flags documented in `WAYSHOT_HDR.md`.
+
 <p align=center>
   <img src="https://git.sr.ht/~shinyzenith/wayshot/blob/main/docs/assets/wayshot.png" alt=wayshot width=60%>
   <p align=center>A native, blazing-fast 🚀🚀🚀 screenshot tool for wlroots based compositors such as sway and river written in Rust.</p>
@@ -42,6 +46,18 @@ Screenshot and copy to clipboard:
 
 ```bash
 wayshot --clipboard
+```
+
+Capture a raw DMA-BUF dump for HDR workflows (requires specifying the output):
+
+```bash
+wayshot --output DP-3 --dmabuf /dev/dri/renderD128 --file ~/Pictures/dp-3.rgba10
+```
+
+Capture an HDR PNG and an SDR tone-mapped WebP in one go:
+
+```bash
+wayshot --output DP-3 --embed-hdr-icc --tone-map-file ~/Pictures/dp-3-sdr.webp ~/Pictures/dp-3.png
 ```
 
 Pick a hex color code, using ImageMagick:

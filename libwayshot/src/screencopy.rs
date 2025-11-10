@@ -5,21 +5,20 @@ use std::{
 };
 
 use gbm::BufferObject;
-use image::{ColorType, DynamicImage, ImageBuffer, Pixel};
+use image::{ColorType, DynamicImage, ImageBuffer, Pixel, Rgb, Rgba};
 use memmap2::MmapMut;
 use rustix::{
     fs::{self, SealFlags},
     io, shm,
 };
 use wayland_client::protocol::{
-    wl_buffer::WlBuffer, wl_output, wl_shm::Format, wl_shm_pool::WlShmPool,
+    wl_buffer::WlBuffer,
+    wl_output,
+    wl_shm::{self, Format},
+    wl_shm_pool::WlShmPool,
 };
 
-use crate::{
-    Error, Result,
-    convert::create_converter,
-    region::{LogicalRegion, Size},
-};
+use crate::{Error, Result, region::{LogicalRegion, Size}};
 
 pub struct FrameGuard {
     pub buffer: WlBuffer,
@@ -130,25 +129,24 @@ pub struct FrameCopy {
 
 impl FrameCopy {
     pub(crate) fn get_image(&mut self) -> Result<DynamicImage, Error> {
-        let frame_color_type = match create_converter(self.frame_format.format) {
-            Some(converter) => {
-                let FrameData::Mmap(raw) = &mut self.frame_data else {
-                    return Err(Error::InvalidColor);
-                };
-                converter.convert_inplace(raw)
-            }
-            _ => {
-                tracing::error!("Unsupported buffer format: {:?}", self.frame_format.format);
-                tracing::error!(
-                    "You can send a feature request for the above format to the mailing list for wayshot over at https://sr.ht/~shinyzenith/wayshot."
-                );
-                return Err(Error::NoSupportedBufferFormat);
-            }
-        };
-        self.frame_color_type = frame_color_type;
-        let image: DynamicImage = (&*self).try_into()?;
+        let image: DynamicImage = (self as &FrameCopy).try_into()?;
         Ok(image)
     }
+}
+
+/// Representation of a frame copied via DMA-BUF.
+///
+/// The buffer contents remain in GPU memory and can be accessed by mapping the underlying GBM
+/// buffer object. This is the recommended path when capturing HDR or otherwise high bit-depth
+/// outputs because no implicit down-conversion to 8-bit occurs.
+#[derive(Debug)]
+pub struct DMAFrameCopy {
+    pub frame_format: DMAFrameFormat,
+    pub buffer_object: BufferObject<()>,
+    pub transform: wl_output::Transform,
+    /// Logical region with the transform already applied.
+    pub logical_region: LogicalRegion,
+    pub physical_size: Size,
 }
 
 impl TryFrom<&FrameCopy> for DynamicImage {
@@ -162,8 +160,126 @@ impl TryFrom<&FrameCopy> for DynamicImage {
             ColorType::Rgba8 => {
                 Self::ImageRgba8(create_image_buffer(&value.frame_format, &value.frame_data)?)
             }
+            ColorType::Rgb16 => {
+                let (width, height) = (
+                    value.frame_format.size.width,
+                    value.frame_format.size.height,
+                );
+                let buffer = value.to_rgb16_vec()?;
+                let image = ImageBuffer::<Rgb<u16>, _>::from_vec(width, height, buffer)
+                    .ok_or(Error::BufferTooSmall)?;
+                Self::ImageRgb16(image)
+            }
+            ColorType::Rgba16 => {
+                let (width, height) = (
+                    value.frame_format.size.width,
+                    value.frame_format.size.height,
+                );
+                let buffer = value.to_rgba16_vec()?;
+                let image = ImageBuffer::<Rgba<u16>, _>::from_vec(width, height, buffer)
+                    .ok_or(Error::BufferTooSmall)?;
+                Self::ImageRgba16(image)
+            }
             _ => return Err(Error::InvalidColor),
         })
+    }
+}
+
+impl FrameCopy {
+    fn mmap_bytes(&self) -> Result<&[u8]> {
+        match &self.frame_data {
+            FrameData::Mmap(mmap) => Ok(&mmap[..]),
+            FrameData::GBMBo(_) => Err(Error::InvalidColor),
+        }
+    }
+
+    fn to_rgb16_vec(&self) -> Result<Vec<u16>> {
+        let order = match self.frame_format.format {
+            wl_shm::Format::Xrgb2101010 | wl_shm::Format::Argb2101010 => ChannelOrder::Rgb,
+            wl_shm::Format::Xbgr2101010 | wl_shm::Format::Abgr2101010 => ChannelOrder::Bgr,
+            _ => return Err(Error::InvalidColor),
+        };
+        convert_10bit_to_u16(self.mmap_bytes()?, order, false)
+    }
+
+    fn to_rgba16_vec(&self) -> Result<Vec<u16>> {
+        let order = match self.frame_format.format {
+            wl_shm::Format::Argb2101010 => ChannelOrder::Rgb,
+            wl_shm::Format::Abgr2101010 => ChannelOrder::Bgr,
+            _ => return Err(Error::InvalidColor),
+        };
+        convert_10bit_to_u16(self.mmap_bytes()?, order, true)
+    }
+}
+
+#[derive(Copy, Clone)]
+enum ChannelOrder {
+    Rgb,
+    Bgr,
+}
+
+fn convert_10bit_to_u16(data: &[u8], order: ChannelOrder, include_alpha: bool) -> Result<Vec<u16>> {
+    if data.len() % 4 != 0 {
+        return Err(Error::BufferTooSmall);
+    }
+    let mut out = Vec::with_capacity((data.len() / 4) * if include_alpha { 4 } else { 3 });
+    for chunk in data.chunks_exact(4) {
+        let pixel = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let r = expand_10_bit(((pixel >> 20) & 0x3ff) as u16);
+        let g = expand_10_bit(((pixel >> 10) & 0x3ff) as u16);
+        let b = expand_10_bit((pixel & 0x3ff) as u16);
+        let (c0, c1, c2) = match order {
+            ChannelOrder::Rgb => (r, g, b),
+            ChannelOrder::Bgr => (b, g, r),
+        };
+        out.push(c0);
+        out.push(c1);
+        out.push(c2);
+        if include_alpha {
+            let alpha = ((pixel >> 30) & 0x3) as u16;
+            out.push(expand_alpha_2bit(alpha));
+        }
+    }
+    Ok(out)
+}
+
+fn expand_10_bit(value: u16) -> u16 {
+    // Scale 10-bit to 16-bit by repeating the high bits.
+    (value << 6) | (value >> 4)
+}
+
+fn expand_alpha_2bit(value: u16) -> u16 {
+    match value {
+        0 => 0x0000,
+        1 => 0x5555,
+        2 => 0xAAAA,
+        _ => 0xFFFF,
+    }
+}
+
+impl DMAFrameCopy {
+    /// Map the DMA-BUF backed frame for CPU access.
+    ///
+    /// This helper will map the entire buffer region and pass the resulting [`gbm::MappedBufferObject`]
+    /// to the provided closure. The mapping is released as soon as the closure returns.
+    pub fn map<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&gbm::MappedBufferObject<'_, ()>) -> R,
+    {
+        self.buffer_object
+            .map(
+                0,
+                0,
+                self.frame_format.size.width,
+                self.frame_format.size.height,
+                f,
+            )
+            .map_err(Error::from)
+    }
+
+    /// Consume the frame and return the owned GBM [`BufferObject`].
+    pub fn into_buffer_object(self) -> BufferObject<()> {
+        self.buffer_object
     }
 }
 
